@@ -53,6 +53,7 @@ type DiskWriter struct {
 const tmpForCreationBlockDirSuffix = ".tmp-for-creation"
 
 // NewDiskWriter allows to write single TSDB block to disk and returns statistics.
+// Destination block directory has to exists.
 func NewDiskWriter(ctx context.Context, logger log.Logger, bDir string) (_ *DiskWriter, err error) {
 	bTmp := bDir + tmpForCreationBlockDirSuffix
 
@@ -129,9 +130,12 @@ func (d *DiskWriter) Flush() (_ tsdb.BlockStats, err error) {
 	}
 	d.closers = nil
 
-	// Block successfully written, make it visible in destination dir by moving it from tmp one.
-	if err := fileutil.Replace(d.bTmp, d.bDir); err != nil {
-		return tsdb.BlockStats{}, errors.Wrap(err, "rename block dir")
+	// Block files successfully written, make them visible by moving files from tmp dir.
+	if err := fileutil.Replace(filepath.Join(d.bTmp, IndexFilename), filepath.Join(d.bDir, IndexFilename)); err != nil {
+		return tsdb.BlockStats{}, errors.Wrap(err, "replace index file")
+	}
+	if err := fileutil.Replace(filepath.Join(d.bTmp, ChunksDirname), filepath.Join(d.bDir, ChunksDirname)); err != nil {
+		return tsdb.BlockStats{}, errors.Wrap(err, "replace chunks dir")
 	}
 	return d.stats, nil
 }

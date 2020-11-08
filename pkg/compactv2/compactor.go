@@ -1,4 +1,4 @@
-package block
+package compactv2
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
@@ -16,15 +17,22 @@ import (
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
 	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/prometheus/prometheus/tsdb/tombstones"
+	"github.com/thanos-io/thanos/pkg/block"
 )
 
-type printChangeLog interface {
+type ChangeLogger interface {
 	DeleteSeries(del labels.Labels, intervals tombstones.Intervals)
 	ModifySeries(old labels.Labels, new labels.Labels)
 }
 
 type changeLog struct {
 	w io.Writer
+}
+
+func NewChangeLog(w io.Writer) *changeLog {
+	return &changeLog{
+		w: w,
+	}
 }
 
 func (l *changeLog) DeleteSeries(del labels.Labels, intervals tombstones.Intervals) {
@@ -35,12 +43,34 @@ func (l *changeLog) ModifySeries(old labels.Labels, new labels.Labels) {
 	_, _ = fmt.Fprintf(l.w, "Relabelled %v %v\n", old.String(), new.String())
 }
 
-type seriesWriter struct {
+type ProgressLogger interface {
+	SeriesProcessed()
+}
+
+type progressLogger struct {
+	logger log.Logger
+
+	series    int
+	processed int
+}
+
+func NewProgressLogger(logger log.Logger, series int) *progressLogger {
+	return &progressLogger{logger: logger, series: series}
+}
+
+func (p *progressLogger) SeriesProcessed() {
+	p.processed++
+	if (p.series/10) == 0 || p.processed%(p.series/10) == 0 {
+		level.Info(p.logger).Log("msg", fmt.Sprintf("processed %0.2f%s of %v series", 100*(float64(p.processed)/float64(p.series)), "%", p.series))
+	}
+}
+
+type Compactor struct {
 	tmpDir string
 	logger log.Logger
 
 	chunkPool    chunkenc.Pool
-	changeLogger printChangeLog
+	changeLogger ChangeLogger
 
 	dryRun bool
 }
@@ -50,8 +80,8 @@ type seriesReader struct {
 	cr tsdb.ChunkReader
 }
 
-func NewSeriesWriter(tmpDir string, logger log.Logger, changeLogger printChangeLog, pool chunkenc.Pool) *seriesWriter {
-	return &seriesWriter{
+func New(tmpDir string, logger log.Logger, changeLogger ChangeLogger, pool chunkenc.Pool) *Compactor {
+	return &Compactor{
 		tmpDir:       tmpDir,
 		logger:       logger,
 		changeLogger: changeLogger,
@@ -59,8 +89,14 @@ func NewSeriesWriter(tmpDir string, logger log.Logger, changeLogger printChangeL
 	}
 }
 
+func NewDryRun(tmpDir string, logger log.Logger, changeLogger ChangeLogger, pool chunkenc.Pool) *Compactor {
+	s := New(tmpDir, logger, changeLogger, pool)
+	s.dryRun = true
+	return s
+}
+
 // TODO(bwplotka): Upstream this.
-func (w *seriesWriter) WriteSeries(ctx context.Context, readers []Reader, sWriter Writer, modifiers ...Modifier) (err error) {
+func (w *Compactor) WriteSeries(ctx context.Context, readers []block.Reader, sWriter block.Writer, p ProgressLogger, modifiers ...Modifier) (err error) {
 	if len(readers) == 0 {
 		return errors.New("cannot write from no readers")
 	}
@@ -104,14 +140,34 @@ func (w *seriesWriter) WriteSeries(ctx context.Context, readers []Reader, sWrite
 	}
 
 	for _, m := range modifiers {
-		symbols, set = m.Modify(symbols, set, w.changeLogger)
+		symbols, set = m.Modify(symbols, set, w.changeLogger, p)
 	}
 
 	if w.dryRun {
+		// Even for dry run, we need to exhaust iterators to see potential changes.
+		for set.Next() {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+
+			s := set.At()
+			iter := s.Iterator()
+			for iter.Next() {
+			}
+			if err := iter.Err(); err != nil {
+				level.Error(w.logger).Log("msg", "error while iterating over chunks", "series", s.Labels(), "err", err)
+			}
+			p.SeriesProcessed()
+		}
+		if err := set.Err(); err != nil {
+			level.Error(w.logger).Log("msg", "error while iterating over set", "err", err)
+		}
 		return nil
 	}
 
-	if err := w.write(ctx, symbols, set, sWriter); err != nil {
+	if err := w.write(ctx, symbols, set, sWriter, p); err != nil {
 		return errors.Wrap(err, "write")
 	}
 	return nil
@@ -214,18 +270,12 @@ func (s *lazyPopulateChunkSeriesSet) Err() error {
 
 func (s *lazyPopulateChunkSeriesSet) Warnings() storage.Warnings { return nil }
 
-// populatableChunk allows to trigger when you want to have chunks populated.
-type populatableChunk interface {
-	Populate(intervals tombstones.Intervals) (err error)
-}
-
 type lazyPopulatableChunk struct {
 	m *chunks.Meta
 
 	cr tsdb.ChunkReader
 
 	populated chunkenc.Chunk
-	bufIter   *tsdb.DeletedIterator
 }
 
 type errChunkIterator struct{ err error }
@@ -246,12 +296,7 @@ func (e errChunk) Iterator(chunkenc.Iterator) chunkenc.Iterator { return e.err }
 func (e errChunk) NumSamples() int                              { return 0 }
 func (e errChunk) Compact()                                     {}
 
-func (l *lazyPopulatableChunk) Populate(intervals tombstones.Intervals) {
-	if len(intervals) > 0 && (tombstones.Interval{Mint: l.m.MinTime, Maxt: l.m.MaxTime}.IsSubrange(intervals)) {
-		l.m.Chunk = EmptyChunk
-		return
-	}
-
+func (l *lazyPopulatableChunk) populate() {
 	// TODO(bwplotka): In most cases we don't need to parse anything, just copy. Extend reader/writer for this.
 	var err error
 	l.populated, err = l.cr.Chunk(l.m.Ref)
@@ -260,70 +305,52 @@ func (l *lazyPopulatableChunk) Populate(intervals tombstones.Intervals) {
 		return
 	}
 
-	var matching tombstones.Intervals
-	for _, interval := range intervals {
-		if l.m.OverlapsClosedInterval(interval.Mint, interval.Maxt) {
-			matching = matching.Add(interval)
-		}
-	}
-
-	if len(matching) == 0 {
-		l.m.Chunk = l.populated
-		return
-	}
-
-	// TODO(bwplotka): Optimize by using passed iterator.
-	l.bufIter = &tsdb.DeletedIterator{Intervals: matching, Iter: l.populated.Iterator(nil)}
-	return
-
+	l.m.Chunk = l.populated
 }
 
 func (l *lazyPopulatableChunk) Bytes() []byte {
 	if l.populated == nil {
-		l.Populate(nil)
+		l.populate()
 	}
 	return l.populated.Bytes()
 }
 
 func (l *lazyPopulatableChunk) Encoding() chunkenc.Encoding {
 	if l.populated == nil {
-		l.Populate(nil)
+		l.populate()
 	}
 	return l.populated.Encoding()
 }
 
 func (l *lazyPopulatableChunk) Appender() (chunkenc.Appender, error) {
 	if l.populated == nil {
-		l.Populate(nil)
+		l.populate()
 	}
 	return l.populated.Appender()
 }
 
 func (l *lazyPopulatableChunk) Iterator(iterator chunkenc.Iterator) chunkenc.Iterator {
 	if l.populated == nil {
-		l.Populate(nil)
+		l.populate()
 	}
-	if l.bufIter == nil {
-		return l.populated.Iterator(iterator)
-	}
-	return l.bufIter
+	return l.populated.Iterator(iterator)
 }
 
 func (l *lazyPopulatableChunk) NumSamples() int {
 	if l.populated == nil {
-		l.Populate(nil)
+		l.populate()
 	}
 	return l.populated.NumSamples()
 }
 
 func (l *lazyPopulatableChunk) Compact() {
 	if l.populated == nil {
-		l.Populate(nil)
+		l.populate()
 	}
 	l.populated.Compact()
 }
 
-func (w *seriesWriter) write(ctx context.Context, symbols index.StringIter, populatedSet storage.ChunkSeriesSet, sWriter SeriesWriter) error {
+func (w *Compactor) write(ctx context.Context, symbols index.StringIter, populatedSet storage.ChunkSeriesSet, sWriter block.SeriesWriter, p ProgressLogger) error {
 	var (
 		chks []chunks.Meta
 		ref  uint64
@@ -361,6 +388,8 @@ func (w *seriesWriter) write(ctx context.Context, symbols index.StringIter, popu
 
 		// Skip the series with all deleted chunks.
 		if len(chks) == 0 {
+			// All series will be ignored.
+			p.SeriesProcessed()
 			continue
 		}
 
@@ -370,13 +399,13 @@ func (w *seriesWriter) write(ctx context.Context, symbols index.StringIter, popu
 		if err := sWriter.AddSeries(ref, s.Labels(), chks...); err != nil {
 			return errors.Wrap(err, "add series")
 		}
-
 		for _, chk := range chks {
 			if err := w.chunkPool.Put(chk.Chunk); err != nil {
 				return errors.Wrap(err, "put chunk")
 			}
 		}
 		ref++
+		p.SeriesProcessed()
 	}
 	if populatedSet.Err() != nil {
 		return errors.Wrap(populatedSet.Err(), "iterate populated chunk series set")

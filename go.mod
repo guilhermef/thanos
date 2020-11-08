@@ -77,7 +77,7 @@ replace (
 	// Update to v1.1.1 to make sure windows CI pass.
 	github.com/elastic/go-sysinfo => github.com/elastic/go-sysinfo v1.1.1
 	// Make sure Prometheus version is pinned as Prometheus semver does not include Go APIs.
-	github.com/prometheus/prometheus => ../prometheus
+	github.com/prometheus/prometheus => github.com/prometheus/prometheus v1.8.2-0.20201108220916-6ba28869528e
 	github.com/sercand/kuberesolver => github.com/sercand/kuberesolver v2.4.0+incompatible
 	google.golang.org/grpc => google.golang.org/grpc v1.29.1
 

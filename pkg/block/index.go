@@ -282,15 +282,15 @@ func Repair(logger log.Logger, dir string, id ulid.ULID, source metadata.SourceT
 
 	chunkw, err := chunks.NewWriter(filepath.Join(resdir, ChunksDirname))
 	if err != nil {
-		return resid, errors.Wrap(err, "open chunk seriesWriter")
+		return resid, errors.Wrap(err, "open chunk Compactor")
 	}
-	defer runutil.CloseWithErrCapture(&err, chunkw, "repair chunk seriesWriter")
+	defer runutil.CloseWithErrCapture(&err, chunkw, "repair chunk Compactor")
 
 	indexw, err := index.NewWriter(context.TODO(), filepath.Join(resdir, IndexFilename))
 	if err != nil {
-		return resid, errors.Wrap(err, "open index seriesWriter")
+		return resid, errors.Wrap(err, "open index Compactor")
 	}
-	defer runutil.CloseWithErrCapture(&err, indexw, "repair index seriesWriter")
+	defer runutil.CloseWithErrCapture(&err, indexw, "repair index Compactor")
 
 	// TODO(fabxc): adapt so we properly handle the version once we update to an upstream
 	// that has multiple.

@@ -54,13 +54,10 @@ func NewBucket(rootDir string) (*Bucket, error) {
 
 // Iter calls f for each entry in the given directory. The argument to f is the full
 // object name including the prefix of the inspected directory.
-func (b *Bucket) Iter(ctx context.Context, dir string, f func(string) error) error {
+func (b *Bucket) Iter(_ context.Context, dir string, f func(string) error) error {
 	absDir := filepath.Join(b.rootDir, dir)
 	info, err := os.Stat(absDir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
 		return errors.Wrapf(err, "stat %s", absDir)
 	}
 	if !info.IsDir() {
@@ -108,7 +105,7 @@ func (r *rangeReaderCloser) Close() error {
 }
 
 // Attributes returns information about the specified object.
-func (b *Bucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+func (b *Bucket) Attributes(_ context.Context, name string) (objstore.ObjectAttributes, error) {
 	file := filepath.Join(b.rootDir, name)
 	stat, err := os.Stat(file)
 	if err != nil {
